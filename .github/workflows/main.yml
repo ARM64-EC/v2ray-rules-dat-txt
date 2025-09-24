@@ -1,4 +1,4 @@
-name: Track LoyalSoldier release → Parse & Publish
+name: "Track LoyalSoldier release → Parse & Publish"
 
 on:
   # Poll upstream every 15 minutes (GitHub can't directly trigger off another repo's Release)
@@ -82,6 +82,8 @@ jobs:
 
       - name: Parse & export to text folders + ZIPs
         if: steps.check_release.outputs.already == 'false'
+        env:
+          UPSTREAM_TAG: ${{ steps.latest.outputs.tag }}
         run: |
           set -euo pipefail
           rm -rf "${OUT_DIR}"
@@ -188,7 +190,9 @@ def export_geosite(dat_path,out_dir):
         f.write("category\tentries\tfile\n")
         for tag,n in counts:
             f.write(f"{tag}\t{n}\t{sanitize(tag)}.txt\n")
-    zip_path=os.path.join(os.path.dirname(out_dir),"geosite_categories_txt.zip")
+    zip_path=os.path.join(os.path.dirname(out_dir), "geosite_categories_txt.zip")
+    # Place ZIP into OUT_DIR (not parent) so later steps can find it:
+    zip_path=os.path.join(out_dir, "geosite_categories_txt.zip")
     with zipfile.ZipFile(zip_path,"w",compression=zipfile.ZIP_DEFLATED) as z:
         z.write(idx,arcname="_INDEX.txt")
         for fp in files:
@@ -196,7 +200,6 @@ def export_geosite(dat_path,out_dir):
     return zip_path
 
 # ---- geoip
-import ipaddress
 def ip_bytes_to_str(b):
     if len(b)==4: return str(ipaddress.IPv4Address(b))
     if len(b)==16: return str(ipaddress.IPv6Address(b))
@@ -260,7 +263,8 @@ def export_geoip(dat_path,out_dir):
         f.write("category\tcidr_count\tfile\n")
         for tag,n in counts:
             f.write(f"{tag}\t{n}\t{sanitize(tag)}.txt\n")
-    zip_path=os.path.join(os.path.dirname(out_dir),"geoip_categories_txt.zip")
+    # Place ZIP into OUT_DIR so later steps can find it:
+    zip_path=os.path.join(out_dir,"geoip_categories_txt.zip")
     with zipfile.ZipFile(zip_path,"w",compression=zipfile.ZIP_DEFLATED) as z:
         z.write(idx,arcname="_INDEX.txt")
         for fp in files:
@@ -274,7 +278,7 @@ geosite_zip = export_geosite("geosite.dat", os.environ["OUT_DIR"]+"/geosite")
 geoip_zip   = export_geoip("geoip.dat",     os.environ["OUT_DIR"]+"/geoip")
 
 with open(os.environ["OUT_DIR"]+"/_SUMMARY.txt","w",encoding="utf-8") as s:
-    s.write("Parsed from upstream tag: " + os.environ.get("GITHUB_REF_NAME","") + "\n")
+    s.write("Parsed from upstream tag: " + os.environ.get("UPSTREAM_TAG","") + "\n")
 PY
 
       - name: Commit parsed folders (not ZIPs)
@@ -310,7 +314,7 @@ PY
           GEOIP_SUMMARY=$(grep -E 'Total (categories|CIDRs):' -h "${OUT_DIR}/geoip/_INDEX.txt"   | paste -sd' | ' -)
 
           BODY=$(cat <<EOF
-**Upstream release:** \`${{ steps.latest.outputs.tag }}\`
+**Upstream release:** \`${TAG}\`
 
 **geosite.zip**
 - ${GEOSITE_SUMMARY}
