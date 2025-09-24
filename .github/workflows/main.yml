@@ -1,0 +1,327 @@
+name: Track LoyalSoldier release → Parse & Publish
+
+on:
+  # Poll upstream every 15 minutes (GitHub can't directly trigger off another repo's Release)
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: parse-v2ray-by-upstream-release
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_OWNER: LoyalSoldier
+      UPSTREAM_REPO: v2ray-rules-dat
+      OUT_DIR: v2ray-export
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install tooling
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Resolve latest upstream release tag
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG=$(gh api "repos/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream tag: ${TAG}"
+
+      - name: Skip if this tag already released here
+        id: check_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.latest.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${TAG} already exists in this repo. Skipping."
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download .dat + .sha256sum from that tag
+        if: steps.check_release.outputs.already == 'false'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.latest.outputs.tag }}"
+          base="https://github.com/${UPSTREAM_OWNER}/${UPSTREAM_REPO}/releases/download/${TAG}"
+
+          curl -fsSL -o geosite.dat              "${base}/geosite.dat"
+          curl -fsSL -o geosite.dat.sha256sum    "${base}/geosite.dat.sha256sum"
+          curl -fsSL -o geoip.dat                "${base}/geoip.dat"
+          curl -fsSL -o geoip.dat.sha256sum      "${base}/geoip.dat.sha256sum"
+
+          ls -lh geosite.dat geoip.dat
+          sha256sum geosite.dat geoip.dat || true
+
+      - name: Verify SHA256 (against upstream sums)
+        if: steps.check_release.outputs.already == 'false'
+        run: |
+          set -euo pipefail
+          ESITE=$(awk '{print $1}' geosite.dat.sha256sum)
+          EIP=$(awk '{print $1}'   geoip.dat.sha256sum)
+
+          echo "${ESITE}  geosite.dat" | sha256sum -c -
+          echo "${EIP}  geoip.dat"     | sha256sum -c -
+
+      - name: Parse & export to text folders + ZIPs
+        if: steps.check_release.outputs.already == 'false'
+        run: |
+          set -euo pipefail
+          rm -rf "${OUT_DIR}"
+          mkdir -p "${OUT_DIR}/geosite" "${OUT_DIR}/geoip"
+
+          python - <<'PY'
+import os, ipaddress, zipfile
+
+def read_varint(buf, i):
+    shift=0; val=0
+    while i<len(buf):
+        b=buf[i]; i+=1
+        val|=(b&0x7F)<<shift
+        if b<0x80: return val,i
+        shift+=7
+        if shift>=64: raise ValueError("varint too long")
+    raise ValueError("EOF varint")
+
+def read_len(buf,i):
+    ln,i=read_varint(buf,i); j=i+ln; return buf[i:j], j
+
+def sanitize(name):
+    s="".join(c if (c.isalnum() or c in "._-+") else "_" for c in name.strip())
+    return s or "untitled"
+
+# ---- geosite
+TYPE_NAMES={0:"plain",1:"regex",2:"domain",3:"full",4:"keyword",5:"suffix"}
+
+def parse_domain_attr(msg):
+    i=0; last=None; attrs={}
+    while i<len(msg):
+        key,i=read_varint(msg,i); wt=key&7; fn=key>>3
+        if wt==2:
+            val,i=read_len(msg,i); s=val.decode("utf-8","ignore")
+            if fn==1: last=s
+            elif fn==2 and last is not None: attrs[last]=s; last=None
+        elif wt==0: _,i=read_varint(msg,i)
+        elif wt==5: i+=4
+        elif wt==1: i+=8
+        else: break
+    return attrs
+
+def parse_domain(msg):
+    i=0; t=0; v=""; attrs={}
+    while i<len(msg):
+        key,i=read_varint(msg,i); wt=key&7; fn=key>>3
+        if wt==0:
+            val,i=read_varint(msg,i)
+            if fn==1: t=val
+        elif wt==2:
+            val,i=read_len(msg,i)
+            if fn==2: v=val.decode("utf-8","ignore")
+            elif fn==3: attrs.update(parse_domain_attr(val))
+        elif wt==5: i+=4
+        elif wt==1: i+=8
+        else: break
+    return t,v,attrs
+
+def parse_geosite_entry(msg):
+    i=0; tag=None; domains=[]
+    while i<len(msg):
+        key,i=read_varint(msg,i); wt=key&7; fn=key>>3
+        if wt==2:
+            val,i=read_len(msg,i)
+            if fn==1: tag=val.decode("utf-8","ignore")
+            elif fn==2: domains.append(parse_domain(val))
+        elif wt==0: _,i=read_varint(msg,i)
+        elif wt==5: i+=4
+        elif wt==1: i+=8
+        else: break
+    return tag,domains
+
+def export_geosite(dat_path,out_dir):
+    data=open(dat_path,"rb").read(); i=0
+    counts=[]; total=0; files=[]
+    while i<len(data):
+        key,i=read_varint(data,i); wt=key&7; fn=key>>3
+        if wt==2:
+            val,i=read_len(data,i)
+            if fn==1:
+                tag,doms=parse_geosite_entry(val)
+                if not tag: continue
+                fp=os.path.join(out_dir, sanitize(tag)+".txt")
+                with open(fp,"w",encoding="utf-8") as f:
+                    f.write(f"# geosite category: {tag}\n")
+                    f.write(f"# entries: {len(doms)}\n")
+                    for t,v,a in doms:
+                        name={0:"plain",1:"regex",2:"domain",3:"full",4:"keyword",5:"suffix"}.get(t,f"type{t}")
+                        line=f"{name}:{v}"
+                        if a:
+                            kv=";".join(f"{k}={a[k]}" for k in sorted(a))
+                            line+=f"    # attrs:{kv}"
+                        f.write(line+"\n")
+                counts.append((tag,len(doms))); total+=len(doms); files.append(fp)
+        elif wt==0: _,i=read_varint(data,i)
+        elif wt==5: i+=4
+        elif wt==1: i+=8
+        else: break
+    idx=os.path.join(out_dir,"_INDEX.txt")
+    with open(idx,"w",encoding="utf-8") as f:
+        f.write("V2Ray/Xray geosite.dat category export\n")
+        f.write(f"Total categories: {len(counts)}\n")
+        f.write(f"Total entries: {total}\n\n")
+        f.write("category\tentries\tfile\n")
+        for tag,n in counts:
+            f.write(f"{tag}\t{n}\t{sanitize(tag)}.txt\n")
+    zip_path=os.path.join(os.path.dirname(out_dir),"geosite_categories_txt.zip")
+    with zipfile.ZipFile(zip_path,"w",compression=zipfile.ZIP_DEFLATED) as z:
+        z.write(idx,arcname="_INDEX.txt")
+        for fp in files:
+            z.write(fp,arcname=os.path.join("geosite_categories", os.path.basename(fp)))
+    return zip_path
+
+# ---- geoip
+import ipaddress
+def ip_bytes_to_str(b):
+    if len(b)==4: return str(ipaddress.IPv4Address(b))
+    if len(b)==16: return str(ipaddress.IPv6Address(b))
+    return ".".join(str(x) for x in b)
+
+def parse_cidr(msg):
+    i=0; ip=b""; pref=0
+    while i<len(msg):
+        key,i=read_varint(msg,i); wt=key&7; fn=key>>3
+        if wt==2:
+            val,i=read_len(msg,i)
+            if fn==1: ip=val
+        elif wt==0:
+            v,i=read_varint(msg,i)
+            if fn==2: pref=v
+        elif wt==5: i+=4
+        elif wt==1: i+=8
+        else: break
+    return ip_bytes_to_str(ip), pref
+
+def parse_geoip_entry(msg):
+    i=0; tag=None; cidrs=[]
+    while i<len(msg):
+        key,i=read_varint(msg,i); wt=key&7; fn=key>>3
+        if wt==2:
+            val,i=read_len(msg,i)
+            if fn==1: tag=val.decode("utf-8","ignore")
+            elif fn==2: cidrs.append(parse_cidr(val))
+        elif wt==0: _,i=read_varint(msg,i)
+        elif wt==5: i+=4
+        elif wt==1: i+=8
+        else: break
+    return tag,cidrs
+
+def export_geoip(dat_path,out_dir):
+    data=open(dat_path,"rb").read(); i=0
+    counts=[]; total=0; files=[]
+    while i<len(data):
+        key,i=read_varint(data,i); wt=key&7; fn=key>>3
+        if wt==2:
+            val,i=read_len(data,i)
+            if fn==1:
+                tag,cidrs=parse_geoip_entry(val)
+                if not tag: continue
+                fp=os.path.join(out_dir, sanitize(tag)+".txt")
+                with open(fp,"w",encoding="utf-8") as f:
+                    f.write(f"# geoip category: {tag}\n")
+                    f.write(f"# cidr_count: {len(cidrs)}\n")
+                    for ip,p in cidrs:
+                        f.write(f"{ip}/{p}\n")
+                counts.append((tag,len(cidrs))); total+=len(cidrs); files.append(fp)
+        elif wt==0: _,i=read_varint(data,i)
+        elif wt==5: i+=4
+        elif wt==1: i+=8
+        else: break
+    idx=os.path.join(out_dir,"_INDEX.txt")
+    with open(idx,"w",encoding="utf-8") as f:
+        f.write("V2Ray/Xray geoip.dat category export\n")
+        f.write(f"Total categories: {len(counts)}\n")
+        f.write(f"Total CIDRs: {total}\n\n")
+        f.write("category\tcidr_count\tfile\n")
+        for tag,n in counts:
+            f.write(f"{tag}\t{n}\t{sanitize(tag)}.txt\n")
+    zip_path=os.path.join(os.path.dirname(out_dir),"geoip_categories_txt.zip")
+    with zipfile.ZipFile(zip_path,"w",compression=zipfile.ZIP_DEFLATED) as z:
+        z.write(idx,arcname="_INDEX.txt")
+        for fp in files:
+            z.write(fp,arcname=os.path.join("geoip_categories", os.path.basename(fp)))
+    return zip_path
+
+os.makedirs(os.environ["OUT_DIR"]+"/geosite", exist_ok=True)
+os.makedirs(os.environ["OUT_DIR"]+"/geoip",   exist_ok=True)
+
+geosite_zip = export_geosite("geosite.dat", os.environ["OUT_DIR"]+"/geosite")
+geoip_zip   = export_geoip("geoip.dat",     os.environ["OUT_DIR"]+"/geoip")
+
+with open(os.environ["OUT_DIR"]+"/_SUMMARY.txt","w",encoding="utf-8") as s:
+    s.write("Parsed from upstream tag: " + os.environ.get("GITHUB_REF_NAME","") + "\n")
+PY
+
+      - name: Commit parsed folders (not ZIPs)
+        if: steps.check_release.outputs.already == 'false'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.latest.outputs.tag }}"
+
+          git add -A "${OUT_DIR}/geosite" "${OUT_DIR}/geoip" "${OUT_DIR}/_SUMMARY.txt"
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: parse upstream ${TAG} [skip ci]"
+            git push
+          fi
+
+      - name: Create Release (tag = upstream tag) & upload ZIPs
+        if: steps.check_release.outputs.already == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.latest.outputs.tag }}"
+          TITLE="Upstream ${TAG}"
+
+          GEOSITE_ZIP="${OUT_DIR}/geosite_categories_txt.zip"
+          GEOIP_ZIP="${OUT_DIR}/geoip_categories_txt.zip"
+
+          GEOSITE_SUMMARY=$(grep -E 'Total (categories|entries):' -h "${OUT_DIR}/geosite/_INDEX.txt" | paste -sd' | ' -)
+          GEOIP_SUMMARY=$(grep -E 'Total (categories|CIDRs):' -h "${OUT_DIR}/geoip/_INDEX.txt"   | paste -sd' | ' -)
+
+          BODY=$(cat <<EOF
+**Upstream release:** \`${{ steps.latest.outputs.tag }}\`
+
+**geosite.zip**
+- ${GEOSITE_SUMMARY}
+
+**geoip.zip**
+- ${GEOIP_SUMMARY}
+EOF
+)
+
+          # Create the release with the upstream tag (creates lightweight tag if needed)
+          gh release create "${TAG}" --title "${TITLE}" --notes "${BODY}"
+
+          # Upload assets
+          gh release upload "${TAG}" "${GEOSITE_ZIP}" "${GEOIP_ZIP}" --clobber
